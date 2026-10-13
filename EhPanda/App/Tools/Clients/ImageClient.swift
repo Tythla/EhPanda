@@ -10,7 +10,8 @@ import Kingfisher
 import ComposableArchitecture
 
 struct ImageClient {
-    let prefetchImages: ([URL]) -> Void
+    /// Prefetches images into the cache and emits the URLs that failed to download as soon as they fail.
+    let prefetchImages: ([URL]) -> AsyncStream<URL>
     let saveImageToPhotoLibrary: (UIImage, Bool) async -> Bool
     let downloadImage: (URL) async -> Result<UIImage, Error>
     let retrieveImage: (String) async -> Result<UIImage, Error>
@@ -19,7 +20,22 @@ struct ImageClient {
 extension ImageClient {
     static let live: Self = .init(
         prefetchImages: { urls in
-            ImagePrefetcher(urls: urls).start()
+            AsyncStream { continuation in
+                var reportedFailureCount = 0
+                ImagePrefetcher(
+                    urls: urls,
+                    progressBlock: { _, failedResources, _ in
+                        failedResources.dropFirst(reportedFailureCount).forEach {
+                            continuation.yield($0.downloadURL)
+                        }
+                        reportedFailureCount = failedResources.count
+                    },
+                    completionHandler: { _, _, _ in
+                        continuation.finish()
+                    }
+                )
+                .start()
+            }
         },
         saveImageToPhotoLibrary: { (image, isAnimated) in
             await withCheckedContinuation { continuation in
@@ -108,7 +124,7 @@ extension DependencyValues {
 // MARK: Test
 extension ImageClient {
     static let noop: Self = .init(
-        prefetchImages: { _ in },
+        prefetchImages: { _ in AsyncStream { $0.finish() } },
         saveImageToPhotoLibrary: { _, _ in false },
         downloadImage: { _ in .success(UIImage()) },
         retrieveImage: { _ in .success(UIImage()) }

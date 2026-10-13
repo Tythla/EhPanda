@@ -29,6 +29,11 @@ struct ReadingReducer {
         case image(UIImage)
     }
 
+    struct PrefetchAnchor: Equatable {
+        let index: Int
+        let limit: Int
+    }
+
     enum ImageAction {
         case copy(Bool)
         case save(Bool)
@@ -62,6 +67,8 @@ struct ReadingReducer {
 
         var webImageLoadSuccessIndices = Set<Int>()
         var webImageAutoRefetchCounts = [Int: Int]()
+        // The latest position images were prefetched around, reused once new image URLs arrive
+        var prefetchAnchor: PrefetchAnchor?
         var imageURLLoadingStates = [Int: LoadingState]()
         var previewLoadingStates = [Int: LoadingState]()
         var databaseLoadingState: LoadingState = .loading
@@ -167,6 +174,7 @@ struct ReadingReducer {
         case fetchImageURLs(Int)
         case refetchImageURLs(Int)
         case prefetchImages(Int, Int)
+        case prefetchImageFailed(Int, URL)
 
         case fetchThumbnailURLs(Int)
         case fetchThumbnailURLsDone(Int, Result<[Int: URL], AppError>)
@@ -243,6 +251,8 @@ struct ReadingReducer {
                 return .none
 
             case .onWebImageFailed(let index):
+                // The same failure can be reported by both the prefetcher and the image view
+                guard state.imageURLLoadingStates[index] != .loading else { return .none }
                 state.imageURLLoadingStates[index] = .failed(.webImageFailed)
                 let refetchCount = state.webImageAutoRefetchCounts[index, default: 0]
                 guard refetchCount < Self.maxWebImageAutoRefetchCount else { return .none }
@@ -424,12 +434,13 @@ struct ReadingReducer {
                 }
 
             case .prefetchImages(let index, let prefetchLimit):
-                func getPrefetchImageURLs(range: ClosedRange<Int>) -> [URL] {
-                    (range.lowerBound...range.upperBound).compactMap { index in
-                        if let url = state.imageURLs[index] {
-                            return url
+                state.prefetchAnchor = .init(index: index, limit: prefetchLimit)
+                func getPrefetchImageURLs(range: ClosedRange<Int>) -> [Int: URL] {
+                    (range.lowerBound...range.upperBound).reduce(into: [:]) { result, index in
+                        // Pages that already gave up are left to the manual retry
+                        if let url = state.imageURLs[index], state.imageURLLoadingStates[index]?.failed == nil {
+                            result[index] = url
                         }
-                        return nil
                     }
                 }
                 func getFetchImageURLIndices(range: ClosedRange<Int>) -> [Int] {
@@ -440,30 +451,42 @@ struct ReadingReducer {
                         return nil
                     }
                 }
-                var prefetchImageURLs = [URL]()
+                var prefetchImageURLs = [Int: URL]()
                 var fetchImageURLIndices = [Int]()
                 var effects = [Effect<Action>]()
                 let previousUpperBound = max(index - 2, 1)
                 let previousLowerBound = max(previousUpperBound - prefetchLimit / 2, 1)
                 if previousUpperBound - previousLowerBound > 0 {
-                    prefetchImageURLs += getPrefetchImageURLs(range: previousLowerBound...previousUpperBound)
+                    prefetchImageURLs.merge(getPrefetchImageURLs(range: previousLowerBound...previousUpperBound)) { $1 }
                     fetchImageURLIndices += getFetchImageURLIndices(range: previousLowerBound...previousUpperBound)
                 }
                 let nextLowerBound = min(index + 2, state.gallery.pageCount)
                 let nextUpperBound = min(nextLowerBound + prefetchLimit / 2, state.gallery.pageCount)
                 if nextUpperBound - nextLowerBound > 0 {
-                    prefetchImageURLs += getPrefetchImageURLs(range: nextLowerBound...nextUpperBound)
+                    prefetchImageURLs.merge(getPrefetchImageURLs(range: nextLowerBound...nextUpperBound)) { $1 }
                     fetchImageURLIndices += getFetchImageURLIndices(range: nextLowerBound...nextUpperBound)
                 }
                 fetchImageURLIndices.forEach {
                     effects.append(.send(.fetchImageURLs($0)))
                 }
                 effects.append(
-                    .run { [prefetchImageURLs] _ in
-                        imageClient.prefetchImages(prefetchImageURLs)
+                    .run { [prefetchImageURLs] send in
+                        let indices = Dictionary(
+                            prefetchImageURLs.map({ ($1, $0) }), uniquingKeysWith: { lhs, _ in lhs }
+                        )
+                        for await failedURL in imageClient.prefetchImages(Array(prefetchImageURLs.values)) {
+                            if let index = indices[failedURL] {
+                                await send(.prefetchImageFailed(index, failedURL))
+                            }
+                        }
                     }
                 )
                 return .merge(effects)
+
+            case .prefetchImageFailed(let index, let url):
+                // Switch to another node in the background instead of waiting for the page to be displayed
+                guard state.imageURLs[index] == url else { return .none }
+                return .send(.onWebImageFailed(index))
 
             case .fetchThumbnailURLs(let index):
                 guard state.imageURLLoadingStates[index] != .loading,
@@ -527,7 +550,10 @@ struct ReadingReducer {
                     batchRange.filter({ $0 <= state.gallery.pageCount }).forEach {
                         state.imageURLLoadingStates[$0] = state.imageURLs[$0] != nil ? .idle : .failed(.notFound)
                     }
-                    return .send(.syncImageURLs(imageURLs, originalImageURLs))
+                    return .merge(
+                        .send(.syncImageURLs(imageURLs, originalImageURLs)),
+                        prefetchAroundAnchor(state: state)
+                    )
                 case .failure(let error):
                     batchRange.forEach {
                         state.imageURLLoadingStates[$0] = .failed(error)
@@ -568,6 +594,7 @@ struct ReadingReducer {
                     state.imageURLLoadingStates[index] = .idle
                     state.updateImageURLs(imageURLs, [:])
                     effects.append(.send(.syncImageURLs(imageURLs, [:])))
+                    effects.append(prefetchAroundAnchor(state: state))
                     return .merge(effects)
                 case .failure(let error):
                     state.imageURLLoadingStates[index] = .failed(error)
@@ -640,7 +667,10 @@ struct ReadingReducer {
                     state.imageURLLoadingStates[index] = .idle
                     state.mpvSkipServerIdentifiers[index] = skipServerIdentifier
                     state.updateImageURLs(imageURLs, originalImageURLs)
-                    return .send(.syncImageURLs(imageURLs, originalImageURLs))
+                    return .merge(
+                        .send(.syncImageURLs(imageURLs, originalImageURLs)),
+                        prefetchAroundAnchor(state: state)
+                    )
                 case .failure(let error):
                     state.imageURLLoadingStates[index] = .failed(error)
                 }
@@ -657,5 +687,11 @@ struct ReadingReducer {
             case: \.share,
             hapticsClient: hapticsClient
         )
+    }
+
+    /// Image URLs that arrive after a page turn would otherwise wait for the next one to be prefetched.
+    private func prefetchAroundAnchor(state: State) -> Effect<Action> {
+        guard let anchor = state.prefetchAnchor else { return .none }
+        return .send(.prefetchImages(anchor.index, anchor.limit))
     }
 }
