@@ -46,6 +46,10 @@ struct ReadingReducer {
         case fetchMPVImageURL
     }
 
+    // Some H@H nodes are unreachable on certain networks (e.g. SNI filtering),
+    // so a failed web image is refetched from another node a few times before giving up.
+    private static let maxWebImageAutoRefetchCount = 3
+
     @ObservableState
     struct State: Equatable {
         var route: Route?
@@ -57,6 +61,7 @@ struct ReadingReducer {
         var hudConfig: TTProgressHUDConfig = .loading
 
         var webImageLoadSuccessIndices = Set<Int>()
+        var webImageAutoRefetchCounts = [Int: Int]()
         var imageURLLoadingStates = [Int: LoadingState]()
         var previewLoadingStates = [Int: LoadingState]()
         var databaseLoadingState: LoadingState = .loading
@@ -227,17 +232,22 @@ struct ReadingReducer {
                 return .merge(effects)
 
             case .onWebImageRetry(let index):
-                state.imageURLLoadingStates[index] = .idle
-                return .none
+                // Retrying the same URL is pointless if its node is unreachable, ask for another node instead
+                state.webImageAutoRefetchCounts[index] = nil
+                return .send(.refetchImageURLs(index))
 
             case .onWebImageSucceeded(let index):
                 state.imageURLLoadingStates[index] = .idle
                 state.webImageLoadSuccessIndices.insert(index)
+                state.webImageAutoRefetchCounts[index] = nil
                 return .none
 
             case .onWebImageFailed(let index):
                 state.imageURLLoadingStates[index] = .failed(.webImageFailed)
-                return .none
+                let refetchCount = state.webImageAutoRefetchCounts[index, default: 0]
+                guard refetchCount < Self.maxWebImageAutoRefetchCount else { return .none }
+                state.webImageAutoRefetchCounts[index] = refetchCount + 1
+                return .send(.refetchImageURLs(index))
 
             case .reloadAllWebImages:
                 state.previewURLs = .init()
@@ -247,15 +257,21 @@ struct ReadingReducer {
                 state.mpvKey = nil
                 state.mpvImageKeys = .init()
                 state.mpvSkipServerIdentifiers = .init()
+                state.webImageAutoRefetchCounts = .init()
                 state.forceRefreshID = .init()
                 return .run { [state] _ in
                     await databaseClient.removeImageURLs(gid: state.gallery.id)
                 }
 
             case .retryAllFailedWebImages:
+                var effects = [Effect<Action>]()
                 state.imageURLLoadingStates.forEach { (index, loadingState) in
-                    if case .failed = loadingState {
-                        state.imageURLLoadingStates[index] = .idle
+                    if case .failed(let error) = loadingState {
+                        if error == .webImageFailed {
+                            effects.append(.send(.onWebImageRetry(index)))
+                        } else {
+                            state.imageURLLoadingStates[index] = .idle
+                        }
                     }
                 }
                 state.previewLoadingStates.forEach { (index, loadingState) in
@@ -263,7 +279,7 @@ struct ReadingReducer {
                         state.previewLoadingStates[index] = .idle
                     }
                 }
-                return .none
+                return .merge(effects)
 
             case .copyImage(let imageURL):
                 return .send(.fetchImage(.copy(imageURL.isGIF), imageURL))
@@ -506,10 +522,11 @@ struct ReadingReducer {
                         }
                         return .none
                     }
-                    batchRange.forEach {
-                        state.imageURLLoadingStates[$0] = .idle
-                    }
                     state.updateImageURLs(imageURLs, originalImageURLs)
+                    // Only the pages that actually failed are marked as failed, the rest stay usable
+                    batchRange.filter({ $0 <= state.gallery.pageCount }).forEach {
+                        state.imageURLLoadingStates[$0] = state.imageURLs[$0] != nil ? .idle : .failed(.notFound)
+                    }
                     return .send(.syncImageURLs(imageURLs, originalImageURLs))
                 case .failure(let error):
                     batchRange.forEach {
@@ -520,12 +537,11 @@ struct ReadingReducer {
 
             case .refetchNormalImageURLs(let index):
                 guard state.imageURLLoadingStates[index] != .loading,
-                      let galleryURL = state.gallery.galleryURL,
-                      let imageURL = state.imageURLs[index]
+                      let galleryURL = state.gallery.galleryURL
                 else { return .none }
                 state.imageURLLoadingStates[index] = .loading
                 let pageNum = state.previewConfig.pageNumber(index: index)
-                return .run { [thumbnailURL = state.thumbnailURLs[index]] send in
+                return .run { [thumbnailURL = state.thumbnailURLs[index], imageURL = state.imageURLs[index]] send in
                     let response = await GalleryNormalImageURLRefetchRequest(
                         index: index,
                         pageNum: pageNum,

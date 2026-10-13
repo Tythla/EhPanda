@@ -549,7 +549,11 @@ struct GalleryNormalImageURLsRequest: Request {
                     .genericRetry()
                     .tryMap { try Kanna.HTML(html: $0.data, encoding: .utf8) }
                     .tryMap { try Parser.parseGalleryNormalImageURL(doc: $0, index: index) }
+                    // A single page failing shouldn't fail the whole batch
+                    .map(Optional.some)
+                    .replaceError(with: nil)
             }
+            .compactMap { $0 }
             .collect()
             .map { tuples in
                 var imageURLs = [Int: URL]()
@@ -560,7 +564,7 @@ struct GalleryNormalImageURLsRequest: Request {
                 }
                 return (imageURLs, originalImageURLs)
             }
-            .mapError(mapAppError)
+            .setFailureType(to: AppError.self)
             .eraseToAnyPublisher()
     }
 }
@@ -570,7 +574,7 @@ struct GalleryNormalImageURLRefetchRequest: Request {
     let pageNum: Int
     let galleryURL: URL
     let thumbnailURL: URL?
-    let storedImageURL: URL
+    let storedImageURL: URL?
 
     var publisher: AnyPublisher<([Int: URL], HTTPURLResponse?), AppError> {
         storedThumbnailURL()

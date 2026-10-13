@@ -88,8 +88,9 @@ extension PreviewConfig {
         }
     }
 
+    // `index` is 1-based, so page N holds indices N * batchSize + 1 ... (N + 1) * batchSize
     func pageNumber(index: Int) -> Int {
-        index / batchSize
+        max(index - 1, 0) / batchSize
     }
     func batchRange(index: Int) -> ClosedRange<Int> {
         let lowerBound = pageNumber(index: index) * batchSize + 1
